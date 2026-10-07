@@ -8,6 +8,7 @@ import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.config.DeviceRe
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.gateway.TelemetryGateway;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.ingest.RegisterFrame;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.uplink.SimulatedCloud;
+import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.model.CloudRejectCode;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -46,8 +47,9 @@ public final class LocalDemo {
                         ThresholdRule.Operator.GT, 30, 5_000))));
         SimulatedCloud cloud = new SimulatedCloud();
         AlertEngine alerts = new AlertEngine(dataDir, ruleStore);
-        TelemetryGateway gw = new TelemetryGateway(dataDir, 20,
-                DeviceRegistry.defaultRegistry(), cloud, alerts);
+        int batchSize = Integer.getInteger("uplink.batchSize", 16);
+        TelemetryGateway gw = new TelemetryGateway(dataDir, 2000,
+                DeviceRegistry.defaultRegistry(), cloud, alerts, batchSize);
 
         System.out.println("== 1. 正常上报（JSON + 寄存器）==");
         gw.ingestJson("""
@@ -65,17 +67,28 @@ public final class LocalDemo {
         gw.ingestJson("{broken-json");
         System.out.println("死信条数=" + gw.deadLetterLog().all().size());
 
-        System.out.println("== 3. 断连积压 + ACK 抖动 ==");
+        System.out.println("== 3. 断连积压 + 批量补传（批大小=" + batchSize + "） ==");
         cloud.setAvailable(false);
-        gw.ingestJson(sample(35, 6_000));
-        gw.ingestJson(sample(36, 8_000));
+        // 云端对一条超龄历史数据永久拒收（EXPIRED）：只隔离它，不堵队头。
+        cloud.addPermanentReject("dev-001|temperature|7000",
+                CloudRejectCode.EXPIRED, "历史数据超过云端接收时限");
+        for (int i = 1; i <= 100; i++) {
+            gw.ingestJson(sample(20 + (i % 10), 6_000L + i * 1_000L));
+        }
         System.out.println("断连滞留=" + gw.pendingCount());
         cloud.setAvailable(true);
-        cloud.simulateAckLossOnce();
         gw.flushPending();
-        System.out.println("ACK 抖动后滞留=" + gw.pendingCount() + "（重发）");
-        gw.flushPending();
-        System.out.println("补传完成滞留=" + gw.pendingCount() + " 云端接收=" + cloud.acceptedCount());
+        System.out.println("批量补传完成 滞留=" + gw.pendingCount()
+                + " 云端接收=" + cloud.acceptedCount()
+                + " 隔离=" + gw.quarantineLog().size()
+                + " 云端批量调用次数=" + gw.cloudBatchCallCount());
+        var report = gw.reconcile();
+        System.out.printf("对账: 入链=%d 云端已接收=%d 已隔离=%d 在途=%d 已淘汰=%d 平衡=%s%n",
+                report.acceptedIngress(), report.cloudAccepted(), report.quarantined(),
+                report.inFlight(), report.evicted(), report.balanced());
+        gw.quarantineLog().all().forEach(e -> System.out.println(
+                "隔离记录: key=" + e.idempotencyKey() + " reason=" + e.reason()
+                        + " detail=" + e.detail()));
 
         System.out.println("== 4. 持续窗口告警与恢复 ==");
         gw.ingestJson(sample(37, 12_000));
