@@ -10,8 +10,10 @@ import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.model.IngestRes
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.model.TelemetryRecord;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.storage.DeadLetterLog;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.storage.EvictionLog;
+import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.storage.QuarantineStore;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.storage.TelemetryArchive;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.uplink.CloudEndpoint;
+import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.uplink.ReconciliationReport;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.uplink.UplinkManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,15 +36,26 @@ public class TelemetryGateway {
     private final PendingBuffer buffer;
     private final EvictionLog evictionLog;
     private final DeadLetterLog deadLetterLog;
+    private final QuarantineStore quarantineStore;
 
     public TelemetryGateway(Path dataDir, int bufferCapacity, DeviceRegistry registry,
                             CloudEndpoint cloud, AlertEngine alertEngine) {
+        this(dataDir, bufferCapacity, registry, cloud, alertEngine, UplinkManager.DEFAULT_BATCH_SIZE);
+    }
+
+    /**
+     * @param batchSize 批量补传批大小（&le; {@link UplinkManager#MAX_BATCH_SIZE}，
+     *                  非正数用缺省值）；缓冲容量与落盘上界不随批大小变化。
+     */
+    public TelemetryGateway(Path dataDir, int bufferCapacity, DeviceRegistry registry,
+                            CloudEndpoint cloud, AlertEngine alertEngine, int batchSize) {
         this.deadLetterLog = new DeadLetterLog(dataDir);
         this.evictionLog = new EvictionLog(dataDir);
+        this.quarantineStore = new QuarantineStore(dataDir);
         this.archive = new TelemetryArchive(dataDir);
         this.normalizer = new Normalizer(registry, deadLetterLog);
-        this.buffer = new PendingBuffer(dataDir, bufferCapacity, evictionLog);
-        this.uplink = new UplinkManager(buffer, cloud);
+        this.buffer = new PendingBuffer(dataDir, bufferCapacity, evictionLog, quarantineStore);
+        this.uplink = new UplinkManager(buffer, cloud, quarantineStore, batchSize);
         this.alertEngine = alertEngine;
         for (TelemetryRecord record : archive.all()) {
             normalizer.restoreWatermark(record.deviceId(), record.metric(), record.timestamp());
@@ -94,6 +107,26 @@ public class TelemetryGateway {
 
     public DeadLetterLog deadLetterLog() {
         return deadLetterLog;
+    }
+
+    public QuarantineStore quarantineStore() {
+        return quarantineStore;
+    }
+
+    /**
+     * 以被接收入链的数据为基准对账：云端已接收、已隔离、仍在途、已淘汰
+     * 四类数字精确配平（入链总数 = 四项之和）。
+     */
+    public ReconciliationReport reconcile() {
+        long acceptedIntoChain = archive.all().size();
+        long inFlight = buffer.size();
+        long quarantined = quarantineStore.size();
+        long evicted = evictionLog.all().size();
+        long cloudAccepted = acceptedIntoChain - quarantined - inFlight - evicted;
+        ReconciliationReport report = new ReconciliationReport(acceptedIntoChain, cloudAccepted,
+                quarantined, inFlight, evicted);
+        log.info("[GATEWAY] {}", report);
+        return report;
     }
 
     public TelemetryArchive archive() {

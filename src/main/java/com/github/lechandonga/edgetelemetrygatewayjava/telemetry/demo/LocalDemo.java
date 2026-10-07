@@ -7,7 +7,9 @@ import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.alert.Threshold
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.config.DeviceRegistry;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.gateway.TelemetryGateway;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.ingest.RegisterFrame;
+import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.model.CloudRejectReason;
 import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.uplink.SimulatedCloud;
+import com.github.lechandonga.edgetelemetrygatewayjava.telemetry.uplink.UplinkManager;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -83,7 +85,27 @@ public final class LocalDemo {
         alerts.events().forEach(e -> System.out.println("事件: " + e.type()
                 + " rule=" + e.ruleId() + " version=" + e.ruleVersion() + " @ " + e.eventTimestamp()));
 
-        System.out.println("== 5. 规则升级到 v2 ==");
+        System.out.println("== 5. 批量补传 + 永久拒收隔离 + 对账 ==");
+        cloud.setAvailable(false);
+        for (int i = 0; i < 10; i++) {
+            gw.ingestJson(sample(21, 20_000L + i * 1_000L));
+        }
+        System.out.println("断连积压=" + gw.pendingCount() + " 批大小="
+                + UplinkManager.DEFAULT_BATCH_SIZE + "（硬上限 " + UplinkManager.MAX_BATCH_SIZE + "）");
+        // 其中一条云端永久拒收（模拟历史超时限），不应堵住后面的数据。
+        cloud.rejectPermanentlyIf(
+                r -> r.timestamp() == 23_000L,
+                CloudRejectReason.EXPIRED, "历史数据超过云端接收时限");
+        cloud.setAvailable(true);
+        gw.flushPending();
+        System.out.println("批量补传后滞留=" + gw.pendingCount()
+                + " 隔离区=" + gw.quarantineStore().size()
+                + " 云端批量调用=" + cloud.batchCallCount());
+        gw.quarantineStore().all().forEach(e -> System.out.println(
+                "隔离: key=" + e.idempotencyKey() + " reason=" + e.reason() + " detail=" + e.detail()));
+        System.out.println(gw.reconcile());
+
+        System.out.println("== 6. 规则升级到 v2 ==");
         alerts.publishRules(new RuleSet("v2", System.currentTimeMillis(), List.of(
                 new ThresholdRule("temp-high", "dev-001", "temperature",
                         ThresholdRule.Operator.GT, 25, 3_000))));
